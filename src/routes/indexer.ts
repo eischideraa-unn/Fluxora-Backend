@@ -17,7 +17,7 @@ import { successResponse } from '../utils/response.js';
 export const indexerRouter = Router();
 
 const INDEXER_AUTH_HEADER = 'x-indexer-worker-token';
-let indexerWorkerToken = process.env.INDEXER_WORKER_TOKEN ?? 'fluxora-dev-indexer-token';
+let indexerWorkerToken = process.env.INDEXER_WORKER_TOKEN ?? '';
 
 function resolveActor(req: Request): string {
   const forwardedFor = req.header('x-forwarded-for');
@@ -342,7 +342,7 @@ export function resetIndexerState(): void {
 
   indexerIngestionService.setStore(defaultIndexerEventStore);
   indexerIngestionService.resetRuntimeState();
-  indexerWorkerToken = process.env.INDEXER_WORKER_TOKEN ?? 'fluxora-dev-indexer-token';
+  indexerWorkerToken = process.env.INDEXER_WORKER_TOKEN ?? '';
 }
 
 export interface IndexerHealthInfo {
