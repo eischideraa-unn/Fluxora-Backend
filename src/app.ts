@@ -44,6 +44,9 @@ export function createApp(options: AppOptions = {}): Express {
   const env = options.env ?? (process.env as Record<string, string | undefined>);
   const rateLimiter = createRateLimiter(env);
 
+  // Expose the limiter on app.locals so index.ts can register a shutdown hook
+  app.locals.rateLimiter = rateLimiter;
+
   // Inject config and healthManager into app.locals for route handlers
   if (options.config) {
     app.locals.config = options.config;

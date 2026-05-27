@@ -6,6 +6,7 @@ import { resetRuntimeRateLimitConfig } from '../../src/config/rateLimits.js';
 import { createRateLimiter } from '../../src/middleware/rateLimiter.js';
 import { createRateLimitsRouter } from '../../src/routes/rateLimits.js';
 import { getRateLimitConfig } from '../../src/config/rateLimits.js';
+import { InMemoryStore } from '../../src/redis/rateLimitStore.js';
 
 const ADMIN_KEY = 'test-admin-key';
 
@@ -33,7 +34,7 @@ function createTestEnv(overrides: Record<string, string | undefined> = {}) {
 // Create a minimal test app for rate limiting tests
 function createTestApp(env: Record<string, string | undefined>) {
   const app = express();
-  const rateLimiter = createRateLimiter(env);
+  const rateLimiter = createRateLimiter(env, new InMemoryStore());
   
   // Add JSON body parsing middleware (required for PUT requests)
   app.use(express.json());
@@ -204,7 +205,7 @@ describe('API endpoints rate limiting', () => {
     // This test needs route-specific config, so let's update our test app
     const env = createTestEnv({ RATE_LIMIT_IP_MAX: '1000' });
     const app = express();
-    const rateLimiter = createRateLimiter(env);
+    const rateLimiter = createRateLimiter(env, new InMemoryStore());
     
     // Add rate limiter middleware
     app.use(rateLimiter);
@@ -229,7 +230,7 @@ describe('API endpoints rate limiting', () => {
     // This test needs route-specific config with write limits
     const env = createTestEnv({ RATE_LIMIT_IP_MAX: '1000' });
     const app = express();
-    const rateLimiter = createRateLimiter(env);
+    const rateLimiter = createRateLimiter(env, new InMemoryStore());
     
     // Add rate limiter middleware
     app.use(rateLimiter);

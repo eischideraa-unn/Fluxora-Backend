@@ -12,5 +12,9 @@
 
 process.env.NODE_ENV = process.env.NODE_ENV ?? 'test';
 process.env.RATE_LIMIT_ENABLED = process.env.RATE_LIMIT_ENABLED ?? 'false';
+process.env.DATABASE_URL =
+  process.env.DATABASE_URL ?? 'postgresql://localhost/fluxora_test';
 process.env.JWT_SECRET =
   process.env.JWT_SECRET ?? 'a-very-long-secret-key-for-testing-only-12345';
+process.env.INDEXER_WORKER_TOKEN =
+  process.env.INDEXER_WORKER_TOKEN ?? 'indexer-worker-token-for-testing-only-12345';

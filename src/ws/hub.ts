@@ -30,6 +30,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import { EventEmitter } from 'node:events';
 import { WebSocket, WebSocketServer } from 'ws';
 import type { IncomingMessage, IncomingHttpHeaders } from 'http';
 import type { Server } from 'http';
@@ -75,6 +76,18 @@ export interface BackpressureMetrics {
   sentMessages: number;
 }
 
+export type BackpressureAction = 'drop' | 'terminate';
+
+export interface StreamHubBackpressureEvent {
+  action: BackpressureAction;
+  streamId: string;
+  eventId: string;
+  connectionId: string;
+  bufferedAmount: number;
+  thresholdBytes: number;
+  timestamp: string;
+}
+
 interface ConnectionMetrics {
   messagesReceived: number;
   messagesSent: number;
@@ -116,7 +129,7 @@ export interface StreamHubOptions {
 
 // ── Hub ───────────────────────────────────────────────────────────────────────
 
-export class StreamHub {
+export class StreamHub extends EventEmitter {
   private readonly wss: WebSocketServer;
   private readonly clients = new Map<WebSocket, ClientState>();
   private readonly streamSubscriptions = new Map<string, Set<WebSocket>>();
@@ -137,6 +150,8 @@ export class StreamHub {
   private terminateBytes: number = BACKPRESSURE_TERMINATE_BYTES;
 
   constructor(server: Server, options?: StreamHubOptions) {
+    super();
+
     if (options?.dedupCache) {
       this.dedup = options.dedupCache;
       this.ownsDedup = false;
@@ -496,6 +511,7 @@ export class StreamHub {
       if (buffered > this.terminateBytes) {
         this.metrics.terminatedConnections++;
         this.metrics.droppedMessages++;
+        this.emitBackpressure(ws, 'terminate', buffered, this.terminateBytes, streamId, eventId);
         try { ws.terminate(); } catch { /* ignore */ }
         this.onDisconnect(ws);
         continue;
@@ -503,6 +519,7 @@ export class StreamHub {
 
       if (buffered > this.dropBytes) {
         this.metrics.droppedMessages++;
+        this.emitBackpressure(ws, 'drop', buffered, this.dropBytes, streamId, eventId);
         continue;
       }
 
@@ -534,6 +551,34 @@ export class StreamHub {
     tracer.endSpan(span, 'ok');
     
     return sent;
+  }
+
+  private emitBackpressure(
+    ws: WebSocket,
+    action: BackpressureAction,
+    bufferedAmount: number,
+    thresholdBytes: number,
+    streamId: string,
+    eventId: string,
+  ): void {
+    const state = this.clients.get(ws);
+    if (!state) return;
+
+    const event: StreamHubBackpressureEvent = {
+      action,
+      streamId,
+      eventId,
+      connectionId: state.id,
+      bufferedAmount,
+      thresholdBytes,
+      timestamp: new Date().toISOString(),
+    };
+
+    this.emit('backpressure', event);
+    logger.warn('WebSocket backpressure applied', state.correlationId, {
+      event: 'ws_backpressure',
+      ...event,
+    });
   }
 
   // ── Helpers ────────────────────────────────────────────────────────────────

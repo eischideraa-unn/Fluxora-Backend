@@ -41,17 +41,22 @@ export function createRateLimitsRouter(limiter: RateLimiter, opts?: RateLimitsRo
    * Returns the caller's current rate-limit status.
    * Optional query parameters: path, method - returns status for specific route
    */
-  rateLimitsRouter.get('/', (req: Request, res: Response) => {
+  rateLimitsRouter.get('/', async (req: Request, res: Response) => {
     const { identifier, identifierType } = limiter.extractClientIdentifier(req);
     const path = typeof req.query.path === 'string' ? req.query.path : undefined;
     const method = typeof req.query.method === 'string' ? req.query.method.toUpperCase() : undefined;
-    const status = limiter.getStatus(identifier, identifierType, path, method);
+
+    // getStatus now queries the live Redis store (or in-memory fallback).
+    const status = await limiter.getStatus(identifier, identifierType, path, method);
 
     res.setHeader('X-RateLimit-Limit', String(status.limit));
     res.setHeader('X-RateLimit-Remaining', String(status.remaining));
     res.setHeader('X-RateLimit-Reset', String(Math.ceil(new Date(status.resetsAt).getTime() / 1000)));
+    if (status.store) res.setHeader('X-RateLimit-Store', status.store);
 
-    res.json(status);
+    // Include degraded flag in body when falling back to in-memory store
+    const body = status.degraded ? { ...status, degraded: true } : status;
+    res.json(body);
   });
 
   /**

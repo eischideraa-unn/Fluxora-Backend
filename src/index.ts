@@ -2,6 +2,8 @@
  * Fluxora Backend - server entry point.
  *
  * Responsibilities:
+ *  - Start OpenTelemetry SDK BEFORE any other import so auto-instrumentation
+ *    patches are applied before express/pg/ioredis are loaded.
  *  - Bind the Express app to a TCP port.
  *  - Register OS signal handlers for graceful shutdown.
  *
@@ -9,28 +11,35 @@
  * Shutdown logic (drain + hooks) lives in shutdown.ts.
  */
 
+// ⚠️  OTel SDK must be the very first import — do not move this line.
+import { startTracing, stopTracing } from './tracing/index.js';
+startTracing();
+
 import http from 'node:http';
 import { createApp } from './app.js';
-import { gracefulShutdown, addShutdownHook } from './shutdown.js';
+import { gracefulShutdown, addShutdownHook, addDrainableShutdownHook } from './shutdown.js';
 import { logger } from './lib/logger.js';
 import { checkPendingMigrations } from './db/migrate.js';
 import { getPool } from './db/pool.js';
 import { createStreamHub, getStreamHub } from './ws/hub.js';
+import { webhookDispatcher } from './webhooks/service.js';
 
 // Export a pre-built app instance for use in tests and other consumers.
 export { app } from './app.js';
 
-// Configuration
-const PORT = parseInt(process.env.PORT || '3000', 10);
 const NODE_ENV = process.env.NODE_ENV || 'development';
 
 async function startServer() {
   try {
+    const { initializeConfig } = await import('./config/env.js');
+    const config = initializeConfig();
+
     // Guard: fail fast if any migrations are pending.
     // Migrations must be applied (e.g. via `pnpm migrate`) before starting.
     await checkPendingMigrations();
 
-    const app = createApp();
+    const { createApp } = await import('./app.js');
+    const app = createApp({ config });
     const server = http.createServer(app);
 
     // Initialize WebSocket hub (registered on the HTTP server as a side effect)
@@ -38,6 +47,22 @@ async function startServer() {
     logger.info('WebSocket hub initialized', undefined, { path: '/ws/streams' });
 
     // Register shutdown hooks
+    webhookDispatcher.start();
+    addDrainableShutdownHook(webhookDispatcher);
+
+    addShutdownHook(async () => {
+      logger.info('Flushing OpenTelemetry spans...');
+      await stopTracing();
+      logger.info('OpenTelemetry SDK stopped');
+    });
+
+    addShutdownHook(async () => {
+      logger.info('Closing rate-limiter store...');
+      const limiter = app.locals.rateLimiter as import('./middleware/rateLimiter.js').RateLimiter | undefined;
+      if (limiter) await limiter.close();
+      logger.info('Rate-limiter store closed');
+    });
+
     addShutdownHook(async () => {
       logger.info('Closing database connections...');
       const pool = getPool();
@@ -74,15 +99,19 @@ async function startServer() {
     });
 
     // Start listening
-    server.listen(PORT, () => {
+    server.listen(config.port, () => {
       logger.info('Fluxora API listening', undefined, { 
-        port: PORT, 
+        port: config.port,
         nodeEnv: NODE_ENV,
         pid: process.pid 
       });
     });
 
   } catch (err) {
+    if (err instanceof Error && err.name === 'EnvironmentError') {
+      console.error(err.message);
+    }
+
     logger.error('Failed to start Fluxora API', undefined, {
       error: err instanceof Error ? err.message : 'Unknown error',
     });

@@ -1,63 +1,74 @@
-# WebSocket Stream Subscriptions
+# WebSocket Streams
 
-Endpoint:
-
-```text
-ws://<host>/ws/streams
-```
-
-Clients receive stream events only after subscribing. A subscription filter may target one stream or one recipient address. Recipient addresses must be Stellar Ed25519 public keys encoded as SEP-23 StrKeys.
-
-## Subscribe
+Fluxora exposes stream updates on `/ws/streams`. Clients subscribe by sending a
+JSON text frame:
 
 ```json
-{ "type": "subscribe", "stream_id": "stream-123" }
+{ "type": "subscribe", "streamId": "stream-id" }
 ```
+
+Broadcast frames use the `stream_update` envelope:
 
 ```json
-{ "type": "subscribe", "recipient_address": "GCCFZVJYMLYWVOSZ63KUEAQSHYOYEEHZVNEK2EJBIEWJLDKAE6WFEGT7" }
+{
+  "type": "stream_update",
+  "streamId": "stream-id",
+  "eventId": "event-id",
+  "payload": {},
+  "correlationId": "optional-correlation-id"
+}
 ```
 
-Recipient subscriptions require WebSocket authentication. The JWT `sub` must be the canonical recipient address, and `recipient_address` must match it.
+## Backpressure Policy
 
-Authenticated clients may subscribe to all events for their own recipient address with an explicit empty filter:
+`StreamHub` checks each server-side `ws.bufferedAmount` before sending a
+broadcast frame. Backpressure is handled per connection, so a slow subscriber
+does not block delivery to healthy subscribers on the same stream.
 
-```json
-{ "type": "subscribe", "filter": {} }
+Default thresholds:
+
+| Setting | Default | Behavior |
+| --- | ---: | --- |
+| `BACKPRESSURE_DROP_BYTES` | 1 MiB | Drop the next outbound frame for that connection. |
+| `BACKPRESSURE_TERMINATE_BYTES` | 4 MiB | Drop the frame and terminate the connection. |
+
+When `bufferedAmount > BACKPRESSURE_DROP_BYTES`, the hub drops that frame for
+the slow connection and increments `droppedMessages`. When
+`bufferedAmount > BACKPRESSURE_TERMINATE_BYTES`, the hub terminates that
+connection, increments both `droppedMessages` and `terminatedConnections`, and
+removes the connection from subscriptions.
+
+The hub does not queue unbounded per-client messages. Recovery is handled by
+future broadcasts after the client's socket drains, or by reconnecting and using
+the replay API backed by the event store.
+
+Tests can lower thresholds with:
+
+```ts
+hub.setBackpressureThresholds({ dropBytes: 8, terminateBytes: 64 });
 ```
 
-The empty filter resolves to the JWT `sub` value.
+Production code should keep `terminateBytes` greater than `dropBytes`.
 
-## Unsubscribe
+## Observability
 
-Use the same filter shape:
+On each drop or termination, `StreamHub` emits a `backpressure` event:
 
-```json
-{ "type": "unsubscribe", "stream_id": "stream-123" }
+```ts
+hub.on('backpressure', (event) => {
+  // action: 'drop' | 'terminate'
+  // streamId, eventId, connectionId, bufferedAmount, thresholdBytes, timestamp
+});
 ```
 
-```json
-{ "type": "unsubscribe", "recipient_address": "GCCFZVJYMLYWVOSZ63KUEAQSHYOYEEHZVNEK2EJBIEWJLDKAE6WFEGT7" }
-```
-
-## Handshake Filter
-
-Clients may include an initial subscription filter in the WebSocket URL:
-
-```text
-ws://<host>/ws/streams?stream_id=stream-123
-ws://<host>/ws/streams?recipient_address=GCCFZVJYMLYWVOSZ63KUEAQSHYOYEEHZVNEK2EJBIEWJLDKAE6WFEGT7
-```
-
-## Event Delivery
-
-`StreamHub.broadcast()` delivers an event to clients whose active filters match:
-
-- `stream_id` equals the event `streamId`
-- `recipient_address` equals the event `recipientAddress`, `payload.recipient_address`, `payload.recipientAddress`, or `payload.recipient`
-
-If a client has both matching stream and recipient subscriptions, it receives the event once.
+It also writes a structured `ws_backpressure` warning log with the same metadata.
+The event and log intentionally exclude payload bodies, JWTs, API keys, and raw
+request headers.
 
 ## Security Notes
 
-Recipient subscriptions are ownership-sensitive. In deployments where recipient privacy matters, enable `WS_AUTH_REQUIRED=true` and issue JWTs whose `sub` is the canonical Stellar recipient address. The hub validates recipient filters with Stellar StrKey shape, version-byte, and checksum rules before indexing them. The hub does not disclose whether a stream exists when a client subscribes to a stream id; it only indexes the filter for future matching broadcasts.
+- Only JSON text frames are accepted; binary frames are rejected.
+- Inbound client messages are capped by `MAX_MESSAGE_BYTES`.
+- Inbound client messages are rate-limited per connection.
+- Optional WebSocket JWT authentication can reject unauthenticated upgrades.
+- Backpressure metadata must not include sensitive stream payload contents.
