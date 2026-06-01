@@ -137,6 +137,14 @@ export const EnvSchema = z.object({
   STELLAR_RPC_RETRY_DELAY: integerEnv('STELLAR_RPC_RETRY_DELAY', 0).default(1000),
 
   JWT_SECRET: z.string().min(32, 'JWT_SECRET must be at least 32 characters'),
+  PGCRYPTO_KEY: z.preprocess(
+    (value) => (value === '' ? undefined : value),
+    z.string().min(32, 'PGCRYPTO_KEY must be at least 32 characters').optional(),
+  ),
+  PGCRYPTO_KEY_PREVIOUS: z.preprocess(
+    (value) => (value === '' ? undefined : value),
+    z.string().min(32, 'PGCRYPTO_KEY_PREVIOUS must be at least 32 characters').optional(),
+  ),
   JWT_EXPIRES_IN: z.string().min(1, 'JWT_EXPIRES_IN cannot be empty').default('24h'),
   API_KEYS: z.string().optional(),
   INDEXER_WORKER_TOKEN: z.string().min(32, 'INDEXER_WORKER_TOKEN must be at least 32 characters'),
@@ -201,7 +209,17 @@ export const EnvSchema = z.object({
   AWS_REGION: optionalString('AWS_REGION'),
   AWS_DEFAULT_REGION: optionalString('AWS_DEFAULT_REGION'),
   FLUXORA_SHUTDOWN: booleanEnv().optional(),
-}).passthrough();
+})
+  .superRefine((env, ctx) => {
+    if (env.PGCRYPTO_KEY_PREVIOUS && !env.PGCRYPTO_KEY) {
+      ctx.addIssue({
+        path: ['PGCRYPTO_KEY_PREVIOUS'],
+        code: z.ZodIssueCode.custom,
+        message: 'PGCRYPTO_KEY is required when PGCRYPTO_KEY_PREVIOUS is set',
+      });
+    }
+  })
+  .passthrough();
 
 type ParsedEnv = z.infer<typeof EnvSchema>;
 
@@ -230,6 +248,8 @@ export interface Config {
   contractAddresses: ContractAddresses;
 
   jwtSecret: string;
+  pgcryptoKey?: string | undefined;
+  pgcryptoKeyPrevious?: string | undefined;
   jwtExpiresIn: string;
   apiKeys: string[];
   indexerWorkerToken: string;
@@ -357,6 +377,8 @@ function toConfig(env: ParsedEnv): Config {
     contractAddresses: resolveContractAddresses(stellarNetwork, env),
 
     jwtSecret: env.JWT_SECRET,
+    pgcryptoKey: env.PGCRYPTO_KEY,
+    pgcryptoKeyPrevious: env.PGCRYPTO_KEY_PREVIOUS,
     jwtExpiresIn: env.JWT_EXPIRES_IN,
     apiKeys: (env.API_KEYS ?? (env.NODE_ENV === 'test' ? 'test-api-key' : ''))
       .split(',')
