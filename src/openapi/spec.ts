@@ -169,36 +169,270 @@ registry.registerPath({
 
 // ── Streams ───────────────────────────────────────────────────────────────────
 
+/**
+ * Cursor semantics for GET /api/streams
+ * ----------------------------------------
+ * ENCODING
+ *   Each cursor is an opaque base64url token. Internally it encodes a
+ *   version-tagged JSON object `{ v: 1, lastId: "<stream-id>" }`, where
+ *   `lastId` is the `id` of the last stream returned on the previous page.
+ *   Clients MUST treat cursors as black boxes — the internal structure is
+ *   not part of the public API and may change without notice. Do not
+ *   construct or decode cursors manually.
+ *
+ *   Security: cursors do NOT contain raw database row IDs or any plaintext
+ *   PII. The `lastId` value is the application-level stream identifier
+ *   (e.g. `stream-abc123`), which is already visible in every list response.
+ *   Ownership scoping is enforced by the repository layer on every request,
+ *   independent of the cursor value.
+ *
+ * STABILITY
+ *   Cursors are stable across inserts: new rows added after a cursor is
+ *   issued do not invalidate it, because the query uses a keyset condition
+ *   (`id > lastId`). However, a cursor referencing a deleted or
+ *   compacted stream id will simply skip to the next matching row without
+ *   error — the client observes a gap, not a failure.
+ *
+ *   A structurally invalid cursor (wrong base64url encoding, missing version
+ *   tag, or empty `lastId`) is rejected immediately with 400
+ *   INVALID_CURSOR before any database call is made.
+ *
+ * ORDERING
+ *   Results are returned in ascending `id` order (lexicographically by
+ *   application stream id). This ordering is deterministic and consistent
+ *   across pages because stream ids are generated from a SHA-256 hash of
+ *   the creation input, so they do not collide and are stable once written.
+ *
+ * PAGINATION FLOW
+ *   1. Omit `cursor` to fetch the first page.
+ *   2. If `has_more` is `true`, pass the returned `next_cursor` as the
+ *      `cursor` parameter to fetch the next page.
+ *   3. When `has_more` is `false`, `next_cursor` is `null` and you are on
+ *      the last page — stop iterating.
+ */
+
+/** Cursor token schema with full semantics documented. */
+const StreamCursorToken = registry.register(
+  'StreamCursorToken',
+  z.string().openapi({
+    description:
+      'Opaque base64url pagination cursor issued by the server. ' +
+      'Encodes `{ v: 1, lastId }` internally; treat as a black box. ' +
+      'Pass the `next_cursor` from the previous response verbatim. ' +
+      'Cursors do not expose internal row ids or PII. ' +
+      'Stable across inserts; invalid/expired cursors return 400 INVALID_CURSOR.',
+    example: 'eyJ2IjoxLCJsYXN0SWQiOiJzdHJlYW0tYWJjMTIzIn0',
+  }),
+);
+
+/** Reusable list-page response schema. */
+const StreamListPage = registry.register(
+  'StreamListPage',
+  z.object({
+    streams: z.array(StreamObject).openapi({
+      description: 'Streams on this page, ordered by id ASC.',
+    }),
+    has_more: z.boolean().openapi({
+      description: 'True when additional pages exist. Fetch them by passing `next_cursor`.',
+      example: true,
+    }),
+    next_cursor: StreamCursorToken.nullable().openapi({
+      description:
+        'Cursor to pass as `cursor` on the next request. ' +
+        'Null on the last page (has_more=false).',
+      example: 'eyJ2IjoxLCJsYXN0SWQiOiJzdHJlYW0tYWJjMTIzIn0',
+    }),
+    total: z.number().int().optional().openapi({
+      description: 'Total matching rows. Only present when include_total=true.',
+      example: 42,
+    }),
+  }),
+);
+
+/** 400 body specific to invalid/expired cursor. */
+const InvalidCursorError = z.object({
+  success: z.literal(false),
+  error: z.object({
+    code: z.literal('VALIDATION_ERROR').openapi({ example: 'VALIDATION_ERROR' }),
+    message: z.string().openapi({
+      example: 'cursor must be a valid opaque pagination token',
+    }),
+  }),
+}).openapi({
+  description:
+    'Returned when the `cursor` parameter is present but cannot be decoded ' +
+    '(bad base64url, wrong JSON shape, missing version tag, or empty lastId). ' +
+    'The client must discard the cursor and restart pagination from the first page ' +
+    'by omitting the `cursor` parameter.',
+});
+
 registry.registerPath({
   method: 'get', path: '/api/streams',
-  summary: 'List streams',
+  summary: 'List streams (cursor-paginated)',
+  description:
+    '## Cursor Pagination\n\n' +
+    '**Encoding** — `next_cursor` is an opaque base64url token (`{ v: 1, lastId }` internally). ' +
+    'Never construct or decode it manually; the internal format may change.\n\n' +
+    '**Security** — Cursors do not contain raw database row ids or PII. ' +
+    'The embedded `lastId` is the same application-level id that appears in list responses. ' +
+    'Server-side ownership scoping is re-applied on every request.\n\n' +
+    '**Stability** — Cursors survive concurrent inserts (keyset semantics: `id > lastId`). ' +
+    'Deleting the row referenced by a cursor does not cause an error; the next matching row is returned.\n\n' +
+    '**Ordering** — Pages are returned in ascending `id` order (deterministic lexicographic sort).\n\n' +
+    '**Invalid cursor** — A malformed or tampered cursor returns `400 VALIDATION_ERROR` with ' +
+    '`message: "cursor must be a valid opaque pagination token"` before any database access. ' +
+    'Discard the cursor and restart from page 1.',
   tags: ['streams'],
   request: {
     query: z.object({
-      limit: z.string().optional().openapi({ example: '20', description: 'Page size (1–100)' }),
-      cursor: z.string().optional().openapi({ description: 'Opaque pagination cursor' }),
+      limit: z.string().optional().openapi({
+        example: '20',
+        description: 'Page size (1–100, default 20).',
+      }),
+      cursor: z.string().optional().openapi({
+        description:
+          'Opaque cursor from the previous page's `next_cursor`. ' +
+          'Omit to request the first page. ' +
+          'Treated as a black box — do not construct manually.',
+        example: 'eyJ2IjoxLCJsYXN0SWQiOiJzdHJlYW0tYWJjMTIzIn0',
+      }),
       status: z.string().optional().openapi({ example: 'active' }),
-      sender: z.string().optional(),
-      recipient: z.string().optional(),
-      include_total: z.enum(['true', 'false']).optional(),
+      sender: z.string().optional().openapi({
+        description: 'Filter by sender Stellar address.',
+        example: 'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN',
+      }),
+      recipient: z.string().optional().openapi({
+        description: 'Filter by recipient Stellar address.',
+        example: 'GCEZWKCA5VLDNRLN3RPRJMRZOX3Z6G5CHCGZCP2J7F1NRQKQOHP3OGN',
+      }),
+      include_total: z.enum(['true', 'false']).optional().openapi({
+        description: 'When "true", include total count of matching rows in the response.',
+      }),
     }),
   },
   responses: {
     '200': {
-      description: 'Paginated stream list',
+      description:
+        'Paginated stream list ordered by `id` ASC. ' +
+        'Check `has_more` to determine whether additional pages exist.',
       content: {
         'application/json': {
-          schema: successSchema(z.object({
-            streams: z.array(StreamObject),
-            has_more: z.boolean(),
-            next_cursor: z.string().nullable(),
-            total: z.number().int().optional(),
-          })),
-          example: { success: true, data: { streams: [], has_more: false, next_cursor: null }, meta: { timestamp: '2026-01-01T00:00:00.000Z' } },
+          schema: successSchema(StreamListPage),
+          examples: {
+            firstPage: {
+              summary: 'First page (no cursor supplied)',
+              description: 'Omit `cursor` to request the first page. `has_more: true` means more pages follow.',
+              value: {
+                success: true,
+                data: {
+                  streams: [
+                    {
+                      id: 'stream-aaa111',
+                      sender: 'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN',
+                      recipient: 'GCEZWKCA5VLDNRLN3RPRJMRZOX3Z6G5CHCGZCP2J7F1NRQKQOHP3OGN',
+                      depositAmount: '1000000.0000000',
+                      ratePerSecond: '0.0000116',
+                      startTime: 1700000000,
+                      endTime: 0,
+                      status: 'active',
+                    },
+                  ],
+                  has_more: true,
+                  next_cursor: 'eyJ2IjoxLCJsYXN0SWQiOiJzdHJlYW0tYWFhMTExIn0',
+                },
+                meta: { timestamp: '2026-01-01T00:00:00.000Z', requestId: 'req_abc123' },
+              },
+            },
+            nextPage: {
+              summary: 'Middle page (cursor from previous page)',
+              description:
+                'Pass `next_cursor` from the previous response as the `cursor` query param. ' +
+                'The result set starts exclusively after the last id from the previous page.',
+              value: {
+                success: true,
+                data: {
+                  streams: [
+                    {
+                      id: 'stream-bbb222',
+                      sender: 'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN',
+                      recipient: 'GCEZWKCA5VLDNRLN3RPRJMRZOX3Z6G5CHCGZCP2J7F1NRQKQOHP3OGN',
+                      depositAmount: '500000.0000000',
+                      ratePerSecond: '0.0000058',
+                      startTime: 1700001000,
+                      endTime: 0,
+                      status: 'active',
+                    },
+                  ],
+                  has_more: true,
+                  next_cursor: 'eyJ2IjoxLCJsYXN0SWQiOiJzdHJlYW0tYmJiMjIyIn0',
+                },
+                meta: { timestamp: '2026-01-01T00:01:00.000Z', requestId: 'req_bcd234' },
+              },
+            },
+            lastPage: {
+              summary: 'Last page (has_more=false, next_cursor=null)',
+              description:
+                'When `has_more` is `false`, `next_cursor` is `null` — stop iterating. ' +
+                'The `streams` array may be empty if no rows remain after the cursor.',
+              value: {
+                success: true,
+                data: {
+                  streams: [
+                    {
+                      id: 'stream-zzz999',
+                      sender: 'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN',
+                      recipient: 'GCEZWKCA5VLDNRLN3RPRJMRZOX3Z6G5CHCGZCP2J7F1NRQKQOHP3OGN',
+                      depositAmount: '250000.0000000',
+                      ratePerSecond: '0.0000029',
+                      startTime: 1700002000,
+                      endTime: 1800000000,
+                      status: 'completed',
+                    },
+                  ],
+                  has_more: false,
+                  next_cursor: null,
+                },
+                meta: { timestamp: '2026-01-01T00:02:00.000Z', requestId: 'req_cde345' },
+              },
+            },
+          },
         },
       },
     },
-    '400': errorResponses['400'],
+    '400': {
+      description:
+        'Validation error. Also returned for an invalid or expired cursor — ' +
+        '`error.code` will be `"VALIDATION_ERROR"` and ' +
+        '`error.message` will be `"cursor must be a valid opaque pagination token"`. ' +
+        'Discard the cursor and restart pagination from page 1 (omit `cursor`).',
+      content: {
+        'application/json': {
+          schema: ErrorEnvelope,
+          examples: {
+            invalidCursor: {
+              summary: 'Invalid or expired cursor',
+              value: {
+                success: false,
+                error: {
+                  code: 'VALIDATION_ERROR',
+                  message: 'cursor must be a valid opaque pagination token',
+                },
+              },
+            },
+            invalidLimit: {
+              summary: 'Limit out of range',
+              value: {
+                success: false,
+                error: {
+                  code: 'VALIDATION_ERROR',
+                  message: 'limit must be at most 100',
+                },
+              },
+            },
+          },
+        },
+      },
+    },
     '503': errorResponses['503'],
   },
 });
