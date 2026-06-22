@@ -1,5 +1,6 @@
 import { CORRELATION_ID_HEADER } from '../middleware/correlationId.js';
 import { getCorrelationId } from '../tracing/middleware.js';
+import { logger } from '../lib/logger.js';
 import type { WebhookDeliveryAttempt, WebhookRetryPolicy } from './types.js';
 import { DEFAULT_RETRY_POLICY } from './types.js';
 import { computeWebhookSignature } from './signature.js';
@@ -45,7 +46,12 @@ export class WebhookDispatcher {
   }
 
   /**
-   * Dispatch a webhook with proper signature and error handling
+   * Dispatch a webhook with a signed POST request and retry-safe result.
+   *
+   * Logging contract: structured logs include only stable delivery identifiers
+   * (`deliveryId`, `eventType`, `attemptNumber`) and HTTP `statusCode` when
+   * available. Webhook secrets, raw payloads, signatures, and target URLs are
+   * intentionally excluded from log metadata.
    */
   async dispatch(options: WebhookDispatchOptions): Promise<WebhookDispatchResult> {
     const {
@@ -83,7 +89,6 @@ export class WebhookDispatcher {
       deliveryId,
       eventType,
       attemptNumber,
-      url,
     });
 
     const signature = computeWebhookSignature(secret, timestamp, payload);
@@ -101,6 +106,7 @@ export class WebhookDispatcher {
         await circuitBreakerStore.recordSuccess(url, enhancedPolicy as CircuitBreakerPolicy);
         logger.info('Webhook delivered successfully', undefined, {
           deliveryId,
+          eventType,
           statusCode: response.status,
           attemptNumber,
         });
@@ -126,10 +132,9 @@ export class WebhookDispatcher {
         
         logger.warn('Webhook delivery failed, will retry', undefined, {
           deliveryId,
+          eventType,
           statusCode: response.status,
           attemptNumber,
-          error: errorMessage,
-          nextRetryAt: new Date(nextRetryAt).toISOString(),
         });
 
         return {
@@ -143,10 +148,9 @@ export class WebhookDispatcher {
 
       logger.error('Webhook delivery failed permanently', undefined, {
         deliveryId,
+        eventType,
         statusCode: response.status,
         attemptNumber,
-        error: errorMessage,
-        maxAttempts: this.policy.maxAttempts,
       });
 
       return {
@@ -173,9 +177,8 @@ export class WebhookDispatcher {
         
         logger.warn('Webhook delivery failed with error, will retry', undefined, {
           deliveryId,
+          eventType,
           attemptNumber,
-          error: errorMessage,
-          nextRetryAt: new Date(nextRetryAt).toISOString(),
         });
 
         return {
@@ -188,9 +191,8 @@ export class WebhookDispatcher {
 
       logger.error('Webhook delivery failed permanently with error', undefined, {
         deliveryId,
+        eventType,
         attemptNumber,
-        error: errorMessage,
-        maxAttempts: this.policy.maxAttempts,
       });
 
       return {
@@ -202,7 +204,10 @@ export class WebhookDispatcher {
   }
 
   /**
-   * Send HTTP request to webhook endpoint
+   * Send HTTP request to webhook endpoint.
+   *
+   * This method does not log request metadata; callers must keep secrets,
+   * signatures, raw payloads, and endpoint URLs out of log records.
    */
   private async sendRequest(
     url: string,
@@ -244,7 +249,10 @@ export class WebhookDispatcher {
   }
 
   /**
-   * Validate webhook endpoint before attempting delivery
+   * Validate webhook endpoint reachability.
+   *
+   * Validation failures are logged without URL or exception text metadata to
+   * avoid leaking endpoint credentials or provider-specific details.
    */
   async validateEndpoint(url: string): Promise<boolean> {
     try {
@@ -258,8 +266,8 @@ export class WebhookDispatcher {
 
       clearTimeout(timeoutId);
       return response.status < 500; // Accept any non-server-error status
-    } catch (error) {
-      logger.warn('Webhook endpoint validation failed', undefined, { url, error: error instanceof Error ? error.message : String(error) });
+    } catch {
+      logger.warn('Webhook endpoint validation failed');
       return false;
     }
   }

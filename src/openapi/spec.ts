@@ -237,6 +237,7 @@ const StreamListPage = registry.register(
       example: true,
     }),
     next_cursor: z.union([StreamCursorToken, z.null()]).openapi({
+    next_cursor: StreamCursorToken.nullable().openapi({
       description:
         'Cursor to pass as `cursor` on the next request. ' +
         'Null on the last page (has_more=false).',
@@ -292,6 +293,7 @@ registry.registerPath({
       cursor: z.string().optional().openapi({
         description:
           'Opaque cursor from the previous page\'s `next_cursor`. ' +
+          'Opaque cursor from the previous page's `next_cursor`. ' +
           'Omit to request the first page. ' +
           'Treated as a black box — do not construct manually.',
         example: 'eyJ2IjoxLCJsYXN0SWQiOiJzdHJlYW0tYWJjMTIzIn0',

@@ -17,6 +17,7 @@ import type {
 import { DEFAULT_RETRY_POLICY } from './types.js';
 import { webhookDeliveryStore } from './store.js';
 import { computeWebhookSignature } from './signature.js';
+import { calculateNextRetryTime, scheduleWebhookOutboxRetry, shouldRetry } from './retry.js';
 import { calculateNextRetryTime, shouldRetry, checkWebhookDeliveryGate, attemptWebhookDeliveryWithRateLimit, countsTowardCircuitBreaker, type EnhancedRetryPolicy } from './retry.js';
 import { webhookDeliveriesTotal, webhookDeliveryDurationSeconds } from '../metrics/businessMetrics.js';
 import type { WebhookCircuitBreakerStore, CircuitBreakerPolicy } from '../redis/webhookCircuitBreakerStore.js';
@@ -182,7 +183,6 @@ export class WebhookService {
       deliveryId: delivery.deliveryId,
       eventId: event.id,
       eventType: event.type,
-      endpointUrl,
     });
 
     // Attempt immediate delivery when the circuit breaker allows it.
@@ -217,6 +217,13 @@ export class WebhookService {
     const ts = timestamp || Math.floor(Date.now() / 1000).toString();
     const attemptNumber = delivery.attempts.length + 1;
     const correlationId = getCorrelationId();
+    logger.info('Attempting webhook delivery', correlationId !== 'unknown' ? correlationId : undefined, {
+      deliveryId: delivery.deliveryId,
+      eventType: delivery.eventType,
+      attemptNumber,
+      maxAttempts: this.policy.maxAttempts,
+    });
+
     const signature = computeWebhookSignature(secret, ts, delivery.payload);
     const attempt: WebhookDeliveryAttempt = {
       attemptNumber,
@@ -242,11 +249,33 @@ export class WebhookService {
         webhookDeliveryStore.store(delivery);
         logger.info('Webhook delivered successfully', undefined, {
           deliveryId: delivery.deliveryId,
+          eventType: delivery.eventType,
           statusCode: response.status,
-          attempt: attemptNumber,
+          attemptNumber,
         });
         webhookDeliveriesTotal.inc({ outcome: 'success' });
       } else {
+        // Handle non-2xx responses
+        if (shouldRetry(attempt, attemptNumber, this.policy)) {
+          attempt.nextRetryAt = calculateNextRetryTime(attemptNumber, this.policy);
+          delivery.status = 'pending';
+
+          logger.warn('Webhook delivery failed, will retry', undefined, {
+            deliveryId: delivery.deliveryId,
+            eventType: delivery.eventType,
+            statusCode: response.status,
+            attemptNumber,
+          });
+        } else {
+          delivery.status = 'permanent_failure';
+          logger.error('Webhook delivery failed permanently', undefined, {
+            deliveryId: delivery.deliveryId,
+            eventType: delivery.eventType,
+            statusCode: response.status,
+            attemptNumber,
+          });
+        }
+
         delivery.attempts.push(attempt);
         delivery.status = 'pending';
         webhookDeliveryStore.store(delivery);
@@ -254,6 +283,28 @@ export class WebhookService {
       }
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
+
+      if (shouldRetry(attempt, attemptNumber, this.policy)) {
+        attempt.error = errorMessage;
+        attempt.nextRetryAt = calculateNextRetryTime(attemptNumber, this.policy);
+        delivery.status = 'pending';
+
+        logger.warn('Webhook delivery failed with error, will retry', undefined, {
+          deliveryId: delivery.deliveryId,
+          eventType: delivery.eventType,
+          attemptNumber,
+        });
+      } else {
+        attempt.error = errorMessage;
+        delivery.status = 'permanent_failure';
+
+        logger.error('Webhook delivery failed permanently with error', undefined, {
+          deliveryId: delivery.deliveryId,
+          eventType: delivery.eventType,
+          attemptNumber,
+        });
+      }
+
       attempt.error = errorMessage;
       delivery.attempts.push(attempt);
       delivery.status = 'pending';
